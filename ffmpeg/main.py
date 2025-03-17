@@ -1,5 +1,5 @@
 import argparse
-from image_to_video import VideoPlayer
+from image_to_video_ffmpeg import VideoPlayer
 
 def main():
     parser = argparse.ArgumentParser(description="Loop video player with image overlay")
