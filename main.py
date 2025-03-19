@@ -1,71 +1,120 @@
+import ffmpeg
 import subprocess
 import threading
 import time
-import os
-import shutil
+import numpy as np
+import cv2
+import random
+import sys
 
-# File paths
-SOURCE_IMAGE = "images/angry.png"  # The image you edit
-FFMPEG_IMAGE = "images/overlay_ffmpeg.png"  # FFmpeg reads this
-RTSP_INPUT = "rtsp://localhost:8554/camera1"  # RTSP input stream
-OUTPUT_STREAM = "rtsp://localhost:8554/overlay_stream"  # RTSP output
+# Define video dimensions and framerate.
+WIDTH, HEIGHT = 640, 360
+FPS = 25
 
-def start_ffmpeg():
-    """Starts FFmpeg and uses overlay_ffmpeg.png."""
-    # Ensure FFmpeg overlay file exists before starting
-    if not os.path.exists(FFMPEG_IMAGE):
-        print("Creating initial overlay_ffmpeg.png...")
-        shutil.copy(SOURCE_IMAGE, FFMPEG_IMAGE)  # Ensure FFmpeg has an image to read
-
-    # FFmpeg command to overlay image
-    command = [
-        "ffmpeg", "-i", RTSP_INPUT, "-loop", "1", "-i", FFMPEG_IMAGE,
-        "-filter_complex", "[0:v][1:v] overlay=10:10",
-        "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-f", "rtsp", OUTPUT_STREAM
-    ]
-
-    print("Starting FFmpeg with overlay...")
-    process = subprocess.Popen(command)
-    process.wait()  # Keep process running
-
-def watch_overlay():
-    """Detects changes in angry.png and updates overlay_ffmpeg.png safely."""
-    
-    if not os.path.exists(SOURCE_IMAGE):
-        print(f"Error: {SOURCE_IMAGE} does not exist. Please create it.")
-        return
-
-    last_modified = os.path.getmtime(SOURCE_IMAGE)
-
+def start_source_stream():
+    """
+    Streams the source video (example.mp4) in a continuous loop to RTSP stream1.
+    """
+    rtsp_url = 'rtsp://localhost:8554/stream1'
+    process = (
+        ffmpeg
+        .input('videos/example.mp4', re=None, stream_loop='-1')
+        .output(rtsp_url,
+                format='rtsp',
+                rtsp_transport='tcp',
+                vcodec='libx264',
+                preset='veryfast',
+                fflags='nobuffer')
+        .run_async(pipe_stdout=True, pipe_stderr=True)
+    )
     while True:
-        time.sleep(1)  # Check every second
+        if process.poll() is not None:
+            print("[Source Stream] FFmpeg process exited")
+            break
+        line = process.stderr.readline()
+        if line:
+            print("[Source Stream LOG]", line.decode('utf-8', errors='replace'), end='')
 
-        try:
-            current_modified = os.path.getmtime(SOURCE_IMAGE)
-        except FileNotFoundError:
-            continue  # Ignore if the file is temporarily missing
+def generate_dynamic_overlay_frame():
+    """
+    Generates a single RGBA frame (numpy array) of size WIDTH x HEIGHT
+    with a transparent background and random red bounding boxes.
+    """
+    # Start with a fully transparent frame.
+    frame = np.zeros((HEIGHT, WIDTH, 4), dtype=np.uint8)
+    
+    # Generate a random number (1 to 3) of bounding boxes.
+    num_boxes = random.randint(1, 3)
+    for _ in range(num_boxes):
+        # Random top-left corner; ensure a minimum margin.
+        x1 = random.randint(0, WIDTH - 50)
+        y1 = random.randint(0, HEIGHT - 50)
+        # Random width/height between 30 and 100 pixels.
+        box_w = random.randint(30, 100)
+        box_h = random.randint(30, 100)
+        x2 = min(WIDTH - 1, x1 + box_w)
+        y2 = min(HEIGHT - 1, y1 + box_h)
+        # Draw a red rectangle with a thickness of 2.
+        # OpenCV uses BGRA order; red is (0, 0, 255, 255).
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255, 255), thickness=2)
+    return frame
 
-        if current_modified != last_modified:
-            print("Overlay updated! Refreshing...")
-
-            try:
-                shutil.copy(SOURCE_IMAGE, FFMPEG_IMAGE)
-                last_modified = current_modified  # Update last modified time
-            except PermissionError:
-                print("Warning: Unable to update overlay (file in use). Retrying...")
-
-# Run both functions in separate threads
-if __name__ == "__main__":
-    ffmpeg_thread = threading.Thread(target=start_ffmpeg, daemon=True)
-    overlay_thread = threading.Thread(target=watch_overlay, daemon=True)
-
-    ffmpeg_thread.start()
-    overlay_thread.start()
-
-    # Keep main script running
+def start_composite_stream():
+    """
+    Launches an ffmpeg composite process that takes:
+      - Input 0: the source RTSP stream (stream1).
+      - Input 1: raw RGBA frames (dynamic overlay) from a pipe.
+    The overlay filter composites input1 on top of input0.
+    The output is sent to RTSP stream2.
+    """
+    # This ffmpeg command expects two inputs:
+    #   * The first input is the RTSP source.
+    #   * The second input is rawvideo (RGBA) coming via stdin.
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-i', 'rtsp://localhost:8554/stream1',
+        '-f', 'rawvideo',
+        '-pix_fmt', 'rgba',
+        '-s', f'{WIDTH}x{HEIGHT}',
+        '-r', str(FPS),
+        '-i', 'pipe:0',
+        '-filter_complex', '[0:v][1:v]overlay=format=auto',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-f', 'rtsp',
+        'rtsp://localhost:8554/stream2'
+    ]
+    print("Starting composite process:")
+    print(' '.join(ffmpeg_cmd))
+    process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
     try:
         while True:
-            time.sleep(1)
+            # Generate a dynamic overlay frame with random bounding boxes.
+            frame = generate_dynamic_overlay_frame()
+            # Write the raw RGBA bytes to ffmpeg's stdin.
+            process.stdin.write(frame.tobytes())
+            process.stdin.flush()
+            time.sleep(1.0 / FPS)
+    except Exception as e:
+        print("Exception in composite stream:", e)
+    finally:
+        process.stdin.close()
+        process.wait()
+
+if __name__ == '__main__':
+    # Start the source stream thread.
+    source_thread = threading.Thread(target=start_source_stream, daemon=True)
+    # Start the composite (final output) stream thread.
+    composite_thread = threading.Thread(target=start_composite_stream, daemon=True)
+
+    source_thread.start()
+    # Allow a few seconds for the source stream to initialize.
+    time.sleep(5)
+    composite_thread.start()
+
+    try:
+        source_thread.join()
+        composite_thread.join()
     except KeyboardInterrupt:
-        print("Stopping everything...")
+        print("Shutting down...")
+        sys.exit(0)
